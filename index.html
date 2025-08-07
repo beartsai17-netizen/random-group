@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>隨機分組系統</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      min-height: 100vh;
+      background-color: #f0f4f8;
+    }
+    .container {
+      width: 90%;
+      max-width: 400px;
+      background-color: #fff;
+      padding: 20px;
+      margin-top: 40px;
+      border-radius: 8px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.1);
+    }
+    h1 {
+      text-align: center;
+      font-size: 1.5em;
+      margin-bottom: 20px;
+    }
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: bold;
+    }
+    input[type="text"] {
+      width: 100%;
+      padding: 8px;
+      margin-bottom: 12px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      box-sizing: border-box;
+    }
+    button {
+      width: 100%;
+      padding: 10px;
+      background-color: #007bff;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 1em;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    .result {
+      margin-top: 20px;
+      font-size: 1.2em;
+      text-align: center;
+    }
+    .host-view {
+      display: none;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 8px;
+      text-align: left;
+    }
+    th {
+      background-color: #f2f2f2;
+    }
+    .error {
+      color: red;
+      margin-top: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container" id="participant-view">
+    <h1>隨機分組系統</h1>
+    <div id="form-section">
+      <label for="name-input">請輸入姓名：</label>
+      <input type="text" id="name-input" placeholder="輸入您的姓名">
+      <button id="submit-btn">加入並分組</button>
+      <div id="error-msg" class="error"></div>
+    </div>
+    <div id="result-section" class="result" style="display:none;"></div>
+  </div>
+
+  <div class="container host-view" id="host-view">
+    <h1>主持人：名單與分組</h1>
+    <button id="refresh-btn">刷新名單</button>
+    <button id="clear-btn" style="margin-left:10px;background-color:#dc3545;">清空名單</button>
+    <table id="list-table">
+      <thead><tr><th>#</th><th>姓名</th><th>組別</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <script>
+    (function() {
+      // 預設配置（若伺服器沒有提供則使用）
+      const defaultGroupCount = 3;
+      const defaultGroupSize  = 6;
+      // 動態配置，載入時會被伺服器覆蓋
+      let groupCount = defaultGroupCount;
+      let groupSize  = defaultGroupSize;
+      const blobUrl = 'https://jsonblob.com/api/jsonBlob/1402945704556683264';
+
+      // 檢查是否為主持人視圖（網址帶 ?admin=1）
+      const urlParams = new URLSearchParams(window.location.search);
+      const isAdmin = urlParams.get('admin') === '1';
+      const participantView = document.getElementById('participant-view');
+      const hostView = document.getElementById('host-view');
+
+      if (isAdmin) {
+        participantView.style.display = 'none';
+        hostView.style.display = 'block';
+        document.querySelector('.host-view').style.display = 'block';
+        setupHostView();
+      } else {
+        setupParticipantView();
+      }
+
+      function setupParticipantView() {
+        const nameInput = document.getElementById('name-input');
+        const submitBtn = document.getElementById('submit-btn');
+        const resultSection = document.getElementById('result-section');
+        const errorMsg = document.getElementById('error-msg');
+
+        // 檢查本地是否已報名過；若伺服器已清空名單則允許重新報名
+        const storedName = localStorage.getItem('userName');
+        const storedGroup = localStorage.getItem('userGroup');
+        if (storedName && storedGroup) {
+          // 從伺服器確認該名單是否存在
+          fetch(blobUrl)
+            .then(resp => resp.json())
+            .then(data => {
+              const participants = data.participants || [];
+              const exists = participants.some(item => item.name === storedName && String(item.group) === storedGroup);
+              if (exists) {
+                showResult(storedName, parseInt(storedGroup));
+              } else {
+                // 本地紀錄已失效，清除以便重新報名
+                localStorage.removeItem('userName');
+                localStorage.removeItem('userGroup');
+              }
+            })
+            .catch(err => {
+              console.error(err);
+              // 若無法確認伺服器狀態，仍顯示本地結果避免重複報名
+              showResult(storedName, parseInt(storedGroup));
+            });
+        }
+
+        submitBtn.addEventListener('click', function() {
+          const name = nameInput.value.trim();
+          if (!name) {
+            errorMsg.textContent = '姓名不能為空';
+            return;
+          }
+          errorMsg.textContent = '';
+          registerName(name);
+        });
+
+        function registerName(name) {
+          // 取得當前資料與設定
+          fetch(blobUrl)
+            .then(resp => resp.json())
+            .then(data => {
+              let participants = data.participants || [];
+              // 若伺服器提供設定，覆寫當前組數與人數
+              if (data.config) {
+                groupCount = parseInt(data.config.groupCount) || defaultGroupCount;
+                groupSize  = parseInt(data.config.groupSize)  || defaultGroupSize;
+              }
+              // 計算各組已有的人數
+              const counts = {};
+              for (let i = 1; i <= groupCount; i++) {
+                counts[i] = 0;
+              }
+              participants.forEach(item => {
+                if (item.group > 0 && counts[item.group] !== undefined) {
+                  counts[item.group]++;
+                }
+              });
+              // 收集可用的組別（尚未滿組），並預設包含0代表「沒分到組」的選項
+              const availableGroups = [0];
+              for (let i = 1; i <= groupCount; i++) {
+                if (counts[i] < groupSize) {
+                  availableGroups.push(i);
+                }
+              }
+              // 隨機分配組別
+              let assignedGroup = 0;
+              if (availableGroups.length > 0) {
+                const randomIndex = Math.floor(Math.random() * availableGroups.length);
+                assignedGroup = availableGroups[randomIndex];
+              }
+              // 新增參與者
+              participants.push({ name: name, group: assignedGroup });
+              // 準備更新資料，保留原 config
+              const payload = { participants: participants };
+              if (data.config) {
+                payload.config = data.config;
+              }
+              // 更新資料
+              return fetch(blobUrl, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+              }).then(() => {
+                // 存儲至 localStorage
+                localStorage.setItem('userName', name);
+                localStorage.setItem('userGroup', assignedGroup);
+                // 顯示結果
+                showResult(name, assignedGroup);
+              });
+            })
+            .catch(err => {
+              errorMsg.textContent = '連接伺服器時發生錯誤，請稍後再試。';
+              console.error(err);
+            });
+        }
+
+        function showResult(name, group) {
+          document.getElementById('form-section').style.display = 'none';
+          resultSection.style.display = 'block';
+          let msg;
+          if (group > 0) {
+            msg = `${name}，你是第 ${group} 組！`;
+          } else {
+            msg = `${name}，你沒分到組。`;
+          }
+          // 只顯示訊息，不提供重新報名按鈕
+          resultSection.textContent = msg;
+        }
+      }
+
+      function setupHostView() {
+        const refreshBtn = document.getElementById('refresh-btn');
+        const tableBody = document.querySelector('#list-table tbody');
+        // 用於避免重複產生設定輸入欄位
+        let configInputsInitialized = false;
+
+        refreshBtn.addEventListener('click', loadList);
+        // 清空按鈕
+        const clearBtn = document.getElementById('clear-btn');
+        clearBtn.addEventListener('click', function() {
+          if (!confirm('確定要清空所有參加者名單嗎？此操作無法復原。')) return;
+          // 先取得當前資料以保留設定
+          fetch(blobUrl)
+            .then(resp => resp.json())
+            .then(data => {
+              const payload = { participants: [] };
+              if (data.config) payload.config = data.config;
+              return fetch(blobUrl, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+              });
+            })
+            .then(() => {
+              loadList();
+            })
+            .catch(err => {
+              console.error(err);
+            });
+        });
+        // 初次載入
+        loadList();
+
+        function loadList() {
+          fetch(blobUrl)
+            .then(resp => resp.json())
+            .then(data => {
+              const participants = data.participants || [];
+              const cfg = data.config || {};
+              // 更新當前組數與人數（供其他程式使用）
+              groupCount = parseInt(cfg.groupCount) || defaultGroupCount;
+              groupSize  = parseInt(cfg.groupSize)  || defaultGroupSize;
+              // 清空表格
+              tableBody.innerHTML = '';
+              participants.forEach((item, index) => {
+                const tr = document.createElement('tr');
+                const tdIndex = document.createElement('td');
+                tdIndex.textContent = index + 1;
+                const tdName = document.createElement('td');
+                tdName.textContent = item.name;
+                const tdGroup = document.createElement('td');
+                tdGroup.textContent = item.group > 0 ? item.group : '沒分組';
+                tr.appendChild(tdIndex);
+                tr.appendChild(tdName);
+                tr.appendChild(tdGroup);
+                tableBody.appendChild(tr);
+              });
+              // 初始化或更新主持人設定輸入欄位
+              if (!configInputsInitialized) {
+                initConfigInputs(cfg);
+                configInputsInitialized = true;
+              } else {
+                document.getElementById('group-count-input').value = parseInt(cfg.groupCount) || defaultGroupCount;
+                document.getElementById('group-size-input').value  = parseInt(cfg.groupSize)  || defaultGroupSize;
+              }
+            })
+            .catch(err => {
+              console.error(err);
+              tableBody.innerHTML = '<tr><td colspan="3">載入資料失敗</td></tr>';
+            });
+        }
+
+        // 初始化主持人設定欄位
+        function initConfigInputs(cfg) {
+          const container = document.getElementById('host-view');
+          const configDiv = document.createElement('div');
+          configDiv.style.marginTop = '15px';
+          configDiv.innerHTML = `
+            <label>組數：<input type="number" id="group-count-input" min="1" style="width:60px; margin-right:10px;"></label>
+            <label>每組人數：<input type="number" id="group-size-input" min="1" style="width:80px; margin-right:10px;"></label>
+            <button id="update-config-btn" style="background-color:#28a745; color:#fff; border:none; padding:6px 12px; border-radius:4px; cursor:pointer;">更新設定</button>
+          `;
+          container.appendChild(configDiv);
+          // 設定輸入初始值
+          document.getElementById('group-count-input').value = parseInt(cfg.groupCount) || defaultGroupCount;
+          document.getElementById('group-size-input').value  = parseInt(cfg.groupSize)  || defaultGroupSize;
+          // 綁定更新設定按鈕
+          document.getElementById('update-config-btn').addEventListener('click', function() {
+            const newCount = parseInt(document.getElementById('group-count-input').value) || defaultGroupCount;
+            const newSize  = parseInt(document.getElementById('group-size-input').value)  || defaultGroupSize;
+            // 讀取當前資料並寫入新設定
+            fetch(blobUrl)
+              .then(resp => resp.json())
+              .then(data => {
+                const payload = {
+                  participants: data.participants || [],
+                  config: {
+                    groupCount: newCount,
+                    groupSize: newSize
+                  }
+                };
+                return fetch(blobUrl, {
+                  method: 'PUT',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(payload)
+                });
+              })
+              .then(() => {
+                // 更新本地變數
+                groupCount = newCount;
+                groupSize  = newSize;
+                alert('設定已更新！');
+                loadList();
+              })
+              .catch(err => {
+                console.error(err);
+                alert('更新設定失敗，請稍後再試。');
+              });
+          });
+        }
+      }
+    })();
+  </script>
+</body>
+</html>
