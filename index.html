@@ -37,4 +37,329 @@
     .result { margin-top: 20px; font-size: 1.2em; text-align: center; }
     .host-view { display: none; }
     table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-    th, td
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+    .error { color: red; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <!-- 參與者頁 -->
+  <div class="container" id="participant-view">
+    <h1>隨機分組系統</h1>
+    <div id="form-section">
+      <label for="name-input">請輸入姓名：</label>
+      <input type="text" id="name-input" placeholder="輸入您的姓名">
+      <button id="submit-btn">加入並分組</button>
+      <div id="error-msg" class="error"></div>
+    </div>
+    <div id="result-section" class="result" style="display:none;"></div>
+  </div>
+
+  <!-- 主持人頁 -->
+  <div class="container host-view" id="host-view">
+    <h1>主持人：名單與分組</h1>
+    <button id="refresh-btn">刷新名單</button>
+    <button id="clear-btn" style="margin-left:10px;background-color:#dc3545;">清空名單</button>
+    <table id="list-table">
+      <thead><tr><th>#</th><th>姓名</th><th>組別</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <!-- 主程式（Modular Firebase） -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
+    import {
+      getFirestore, doc, getDoc, setDoc, updateDoc, runTransaction,
+      collection, getDocs, deleteDoc, onSnapshot, serverTimestamp, writeBatch
+    } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
+    import { firebaseConfig } from "./firebase-config.js";
+
+    // ========= Firebase init =========
+    const app = initializeApp(firebaseConfig);
+    const db  = getFirestore(app);
+
+    // ========= 固定場次 ID =========
+    const SID = "default";
+    const sessionRef = doc(db, "sessions", SID);
+    const groupsCol  = collection(db, "sessions", SID, "groups");
+    const assignsCol = collection(db, "sessions", SID, "assignments");
+
+    // ========= DOM =========
+    const participantView = document.getElementById("participant-view");
+    const hostView        = document.getElementById("host-view");
+    const nameInput  = document.getElementById("name-input");
+    const submitBtn  = document.getElementById("submit-btn");
+    const errorMsg   = document.getElementById("error-msg");
+    const resultSec  = document.getElementById("result-section");
+    const refreshBtn = document.getElementById("refresh-btn");
+    const clearBtn   = document.getElementById("clear-btn");
+    const listTable  = document.getElementById("list-table");
+
+    // ========= 預設設定 =========
+    const DEFAULTS = {
+      groupCount: 3,
+      groupSize: 6,
+      noGroupEnabled: true,
+      noGroupProb: 0.10
+    };
+
+    function showError(msg){ if (errorMsg) errorMsg.textContent = msg || ""; }
+    function showResult(name, group) {
+      document.getElementById("form-section").style.display = "none";
+      resultSec.style.display = "block";
+      resultSec.textContent = group > 0 ? `${name}，你是第 ${group} 組！` : `${name}，你沒分到組。`;
+    }
+
+    // 建立 session 與 groups/1..N
+    async function ensureSessionAndGroups() {
+      const snap = await getDoc(sessionRef);
+      let cfg = { ...DEFAULTS, isLocked: false };
+      if (!snap.exists()) {
+        await setDoc(sessionRef, { ...cfg, createdAt: serverTimestamp() });
+      } else {
+        cfg = { ...DEFAULTS, ...(snap.data()||{}) };
+      }
+      for (let i = 1; i <= cfg.groupCount; i++) {
+        const gRef = doc(groupsCol, String(i));
+        const gSnap = await getDoc(gRef);
+        if (!gSnap.exists()) await setDoc(gRef, { count: 0 });
+      }
+      return cfg;
+    }
+
+    // 依剩餘名額「加權」抽組別（交易中執行）
+    async function joinGroup(name) {
+      const key = name.trim().toLowerCase();
+      const assignRef = doc(assignsCol, key);
+
+      const groupNo = await runTransaction(db, async (tx) => {
+        const sSnap = await tx.get(sessionRef);
+        if (!sSnap.exists()) throw new Error("尚未設定組數/每組人數");
+
+        const s = { ...DEFAULTS, ...(sSnap.data()||{}) };
+        const { groupCount, groupSize, noGroupEnabled, noGroupProb, isLocked } = s;
+        if (isLocked) throw new Error("目前已鎖定，停止加入");
+        if (!groupCount || !groupSize) throw new Error("主辦尚未完成設定");
+
+        const aSnap = await tx.get(assignRef);
+        if (aSnap.exists()) return aSnap.data().group;
+
+        const groups = [];
+        for (let i = 1; i <= groupCount; i++) {
+          const gRef = doc(groupsCol, String(i));
+          const gSnap = await tx.get(gRef);
+          const count = gSnap.exists() ? (gSnap.data().count || 0) : 0;
+          groups.push({ id: i, ref: gRef, count });
+        }
+
+        const withCap = groups
+          .map(g => ({ ...g, cap: Math.max(0, groupSize - g.count) }))
+          .filter(g => g.cap > 0);
+
+        let assigned = 0;
+        if (withCap.length === 0) {
+          assigned = 0;
+        } else {
+          const totalCap = withCap.reduce((s, g) => s + g.cap, 0);
+          let r = Math.random() * totalCap;
+          let picked = withCap[0];
+          for (const g of withCap) {
+            r -= g.cap;
+            if (r <= 0) { picked = g; break; }
+          }
+          assigned = picked.id;
+
+          if (noGroupEnabled && Math.random() < Math.max(0, Math.min(1, noGroupProb))) {
+            assigned = 0;
+          }
+          if (assigned > 0) {
+            tx.update(picked.ref, { count: picked.count + 1 });
+          }
+        }
+        tx.set(assignRef, { name, group: assigned, at: serverTimestamp() });
+        return assigned;
+      });
+
+      return groupNo;
+    }
+
+    // 重新渲染名單
+    async function renderList() {
+      const { cfg } = await ensureSessionAndGroups();
+      const aSnaps = await getDocs(assignsCol);
+      const tbody = listTable.querySelector("tbody");
+      tbody.innerHTML = "";
+      let idx = 0;
+      aSnaps.forEach(d => {
+        const a = d.data() || {};
+        const tr = document.createElement("tr");
+        const tdIndex = document.createElement("td"); tdIndex.textContent = (++idx).toString();
+        const tdName  = document.createElement("td"); tdName.textContent  = a.name || "";
+        const tdGroup = document.createElement("td"); tdGroup.textContent = (a.group > 0) ? a.group : "沒分組";
+        tr.appendChild(tdIndex); tr.appendChild(tdName); tr.appendChild(tdGroup);
+        tbody.appendChild(tr);
+      });
+      initOrSyncConfigInputs(cfg);
+    }
+
+    // 批次刪除某集合的所有文件（每批 <= 400）
+    async function batchDeleteAll(colRef) {
+      let snap = await getDocs(colRef);
+      while (!snap.empty) {
+        const batch = writeBatch(db);
+        const chunk = snap.docs.slice(0, 400);
+        chunk.forEach(docSnap => batch.delete(docSnap.ref));
+        await batch.commit();
+        if (snap.docs.length <= 400) break;
+        snap = await getDocs(colRef);
+      }
+    }
+
+    // 清空：刪 assignments、groups 歸零、解除鎖定
+    async function clearAll() {
+      // 1) 刪 assignments/*
+      await batchDeleteAll(assignsCol);
+      // 2) groups/* 歸零（用 batch 更新）
+      const gSnaps = await getDocs(groupsCol);
+      if (!gSnaps.empty) {
+        const batch = writeBatch(db);
+        gSnaps.docs.forEach(d => batch.update(d.ref, { count: 0 }));
+        await batch.commit();
+      }
+      // 3) 重置 session 狀態
+      await updateDoc(sessionRef, { isLocked: false, updatedAt: serverTimestamp() });
+    }
+
+    // 後台設定 UI
+    let configInputsInitialized = false;
+    function initOrSyncConfigInputs(cfg) {
+      const container = document.getElementById("host-view");
+      if (!configInputsInitialized) {
+        const div = document.createElement("div");
+        div.style.marginTop = "15px";
+        div.innerHTML = `
+          <div style="margin:10px 0;">
+            <label>組數：
+              <input type="number" id="group-count-input" min="1" style="width:80px; margin-right:10px;">
+            </label>
+            <label>每組人數：
+              <input type="number" id="group-size-input" min="1" style="width:100px; margin-right:10px;">
+            </label>
+          </div>
+          <div style="margin:10px 0;">
+            <label style="margin-right:10px;">
+              啟用「沒分到組」
+              <input type="checkbox" id="nog-enabled-input" style="margin-left:6px;">
+            </label>
+            <label>
+              「沒分到組」機率（0~1）：
+              <input type="number" id="nog-prob-input" min="0" max="1" step="0.01" style="width:100px;">
+            </label>
+          </div>
+          <button id="update-config-btn" style="background-color:#28a745; color:#fff; border:none; padding:6px 12px; border-radius:4px; cursor:pointer;">更新設定</button>
+        `;
+        container.appendChild(div);
+
+        document.getElementById("update-config-btn").addEventListener("click", async () => {
+          const newCfg = {
+            groupCount: parseInt(document.getElementById("group-count-input").value) || DEFAULTS.groupCount,
+            groupSize:  parseInt(document.getElementById("group-size-input").value)  || DEFAULTS.groupSize,
+            noGroupEnabled: !!document.getElementById("nog-enabled-input").checked,
+            noGroupProb: Math.max(0, Math.min(1, parseFloat(document.getElementById("nog-prob-input").value)))
+          };
+          await setDoc(sessionRef, { ...newCfg, updatedAt: serverTimestamp() }, { merge: true });
+          for (let i = 1; i <= newCfg.groupCount; i++) {
+            const gRef = doc(groupsCol, String(i));
+            const gSnap = await getDoc(gRef);
+            if (!gSnap.exists()) await setDoc(gRef, { count: 0 });
+          }
+          alert("設定已更新！");
+          renderList();
+        });
+
+        configInputsInitialized = true;
+      }
+      document.getElementById("group-count-input").value = cfg.groupCount;
+      document.getElementById("group-size-input").value  = cfg.groupSize;
+      document.getElementById("nog-enabled-input").checked = !!cfg.noGroupEnabled;
+      document.getElementById("nog-prob-input").value      = cfg.noGroupProb;
+    }
+
+    // 畫面切換（?admin=1）
+    const isAdmin = new URLSearchParams(window.location.search).get("admin") === "1";
+    if (isAdmin) {
+      participantView.style.display = "none";
+      hostView.style.display = "block";
+
+      await ensureSessionAndGroups();
+      await renderList();
+      refreshBtn.addEventListener("click", renderList);
+
+      // 兩段式清空：第一次武裝、第二次執行；並在執行時禁用按鈕
+      let armed = false; let timerId = null;
+      const defaultTxt = "清空名單";
+      clearBtn.addEventListener("click", async () => {
+        if (!armed) {
+          armed = true;
+          clearBtn.textContent = "再按一次確認清空";
+          clearBtn.style.opacity = "0.9";
+          timerId = setTimeout(() => {
+            armed = false; clearBtn.textContent = defaultTxt; clearBtn.style.opacity = "1";
+          }, 8000);
+          return;
+        }
+        // 第二次 → 真的清空
+        armed = false;
+        clearTimeout(timerId);
+        clearBtn.disabled = true;
+        const oldTxt = clearBtn.textContent;
+        clearBtn.textContent = "清空中…";
+        try {
+          await clearAll();
+          await renderList();
+          alert("已清空");
+        } catch (e) {
+          alert("清空失敗：" + (e?.message || e));
+        } finally {
+          clearBtn.disabled = false;
+          clearBtn.textContent = defaultTxt;
+          clearBtn.style.opacity = "1";
+        }
+      });
+
+      onSnapshot(assignsCol, renderList);
+      onSnapshot(sessionRef, renderList);
+
+    } else {
+      hostView.style.display = "none";
+      participantView.style.display = "block";
+
+      await ensureSessionAndGroups();
+
+      // 若本機曾報名，試著顯示舊結果；若主持人已清空，則移除 localStorage
+      const storedName  = localStorage.getItem("userName");
+      const storedGroup = localStorage.getItem("userGroup");
+      if (storedName && storedGroup !== null) {
+        try {
+          const a = await getDoc(doc(assignsCol, storedName.trim().toLowerCase()));
+          if (a.exists()) showResult(storedName, a.data().group);
+          else { localStorage.removeItem("userName"); localStorage.removeItem("userGroup"); }
+        } catch {}
+      }
+
+      submitBtn.addEventListener("click", async () => {
+        const name = (nameInput.value || "").trim();
+        if (!name) { showError("姓名不能為空"); return; }
+        showError("");
+        try {
+          const group = await joinGroup(name);
+          localStorage.setItem("userName", name);
+          localStorage.setItem("userGroup", String(group));
+          showResult(name, group);
+        } catch (e) { showError(`加入失敗：${e.message || e}`); }
+      });
+    }
+  </script>
+</body>
+</html>
