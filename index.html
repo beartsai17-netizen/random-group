@@ -71,7 +71,7 @@
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
     import {
       getFirestore, doc, getDoc, setDoc, updateDoc, runTransaction,
-      collection, getDocs, deleteDoc, onSnapshot, serverTimestamp, writeBatch
+      collection, getDocs, onSnapshot, serverTimestamp, writeBatch, query, orderBy
     } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
     import { firebaseConfig } from "./firebase-config.js";
 
@@ -101,8 +101,11 @@
       groupCount: 3,
       groupSize: 6,
       noGroupEnabled: true,
-      noGroupProb: 0.10
+      noGroupProb: 0.10,
+      isLocked: false
     };
+
+    let latestConfig = { ...DEFAULTS };
 
     function showError(msg){ if (errorMsg) errorMsg.textContent = msg || ""; }
     function showResult(name, group) {
@@ -114,7 +117,7 @@
     // 建立 session 與 groups/1..N
     async function ensureSessionAndGroups() {
       const snap = await getDoc(sessionRef);
-      let cfg = { ...DEFAULTS, isLocked: false };
+      let cfg = { ...DEFAULTS };
       if (!snap.exists()) {
         await setDoc(sessionRef, { ...cfg, createdAt: serverTimestamp() });
       } else {
@@ -125,6 +128,7 @@
         const gSnap = await getDoc(gRef);
         if (!gSnap.exists()) await setDoc(gRef, { count: 0 });
       }
+      latestConfig = { ...cfg };
       return cfg;
     }
 
@@ -186,8 +190,15 @@
 
     // 重新渲染名單
     async function renderList() {
-      const { cfg } = await ensureSessionAndGroups();
-      const aSnaps = await getDocs(assignsCol);
+      const cfg = await ensureSessionAndGroups();
+      latestConfig = { ...cfg };
+      let aSnaps;
+      try {
+        aSnaps = await getDocs(query(assignsCol, orderBy("at", "asc")));
+      } catch (err) {
+        // 若舊資料缺少 at 欄位，改以名稱排序避免整體失敗
+        aSnaps = await getDocs(query(assignsCol, orderBy("name")));
+      }
       const tbody = listTable.querySelector("tbody");
       tbody.innerHTML = "";
       let idx = 0;
@@ -262,11 +273,17 @@
         container.appendChild(div);
 
         document.getElementById("update-config-btn").addEventListener("click", async () => {
+          const parsedCount = parseInt(document.getElementById("group-count-input").value, 10);
+          const parsedSize  = parseInt(document.getElementById("group-size-input").value, 10);
+          const parsedProb  = parseFloat(document.getElementById("nog-prob-input").value);
+
           const newCfg = {
-            groupCount: parseInt(document.getElementById("group-count-input").value) || DEFAULTS.groupCount,
-            groupSize:  parseInt(document.getElementById("group-size-input").value)  || DEFAULTS.groupSize,
+            groupCount: Number.isFinite(parsedCount) && parsedCount > 0 ? parsedCount : latestConfig.groupCount,
+            groupSize:  Number.isFinite(parsedSize)  && parsedSize  > 0 ? parsedSize  : latestConfig.groupSize,
             noGroupEnabled: !!document.getElementById("nog-enabled-input").checked,
-            noGroupProb: Math.max(0, Math.min(1, parseFloat(document.getElementById("nog-prob-input").value)))
+            noGroupProb: Number.isFinite(parsedProb)
+              ? Math.max(0, Math.min(1, parsedProb))
+              : latestConfig.noGroupProb
           };
           await setDoc(sessionRef, { ...newCfg, updatedAt: serverTimestamp() }, { merge: true });
           for (let i = 1; i <= newCfg.groupCount; i++) {
@@ -274,8 +291,9 @@
             const gSnap = await getDoc(gRef);
             if (!gSnap.exists()) await setDoc(gRef, { count: 0 });
           }
+          latestConfig = { ...latestConfig, ...newCfg };
           alert("設定已更新！");
-          renderList();
+          await renderList();
         });
 
         configInputsInitialized = true;
@@ -283,7 +301,7 @@
       document.getElementById("group-count-input").value = cfg.groupCount;
       document.getElementById("group-size-input").value  = cfg.groupSize;
       document.getElementById("nog-enabled-input").checked = !!cfg.noGroupEnabled;
-      document.getElementById("nog-prob-input").value      = cfg.noGroupProb;
+      document.getElementById("nog-prob-input").value      = typeof cfg.noGroupProb === "number" ? cfg.noGroupProb : DEFAULTS.noGroupProb;
     }
 
     // 畫面切換（?admin=1）
@@ -294,7 +312,13 @@
 
       await ensureSessionAndGroups();
       await renderList();
-      refreshBtn.addEventListener("click", renderList);
+      refreshBtn.addEventListener("click", async () => {
+        try {
+          await renderList();
+        } catch (e) {
+          alert("刷新失敗：" + (e?.message || e));
+        }
+      });
 
       // 兩段式清空：第一次武裝、第二次執行；並在執行時禁用按鈕
       let armed = false; let timerId = null;
